@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"golang.org/x/exp/maps"
 )
 
 type BroadcastReq struct {
@@ -20,6 +23,10 @@ type BroadcastRes struct {
 type GossipReq struct {
 	Type     string       `json:"type"`
 	Messages map[int]bool `json:"messages"`
+}
+
+type GossipRes struct {
+	Type string `json:"type"`
 }
 
 type Read struct {
@@ -57,14 +64,29 @@ func main() {
 		// Thread safety is important! xoxoxox - your pc
 		mu.Lock()
 		messages[body.Message] = true
+		mu.Unlock()
 
 		for _, neighbor := range n.NodeIDs() {
-			n.Send(neighbor, GossipReq{
-				Type:     "gossip",
-				Messages: messages,
-			})
+			// Don't send to yourself
+			if neighbor == n.ID() {
+				continue
+			}
+
+			go func(neighbor string, message int) {
+				for {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					_, err := n.SyncRPC(ctx, neighbor, GossipReq{
+						Type:     "gossip",
+						Messages: map[int]bool{body.Message: true},
+					})
+					cancel()
+					if err == nil {
+						break
+					}
+				}
+			}(neighbor, body.Message)
+
 		}
-		mu.Unlock()
 
 		return n.Reply(msg, BroadcastRes{Type: "broadcast_ok"})
 	})
@@ -83,7 +105,9 @@ func main() {
 		}
 		mu.Unlock()
 
-		return nil
+		return n.Reply(msg, GossipRes{
+			Type: "gossip_ok",
+		})
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
@@ -93,14 +117,8 @@ func main() {
 		defer mu.Unlock() // Unlock after we return
 
 		return n.Reply(msg, Read{
-			Type: "read_ok",
-			Messages: func() []int {
-				msgs := make([]int, len(messages))
-				for msg := range messages {
-					msgs = append(msgs, msg)
-				}
-				return msgs
-			}(),
+			Type:     "read_ok",
+			Messages: maps.Keys(messages),
 		})
 	})
 
